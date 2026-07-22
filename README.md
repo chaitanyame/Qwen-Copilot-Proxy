@@ -22,6 +22,39 @@ GitHub Copilot Chat ↔️ localhost:11434 (Ollama endpoint)
                       Qwen API (OAuth2)
 ```
 
+## How It Works
+
+Qwen-Copilot-Proxy runs as a FastAPI server that exposes the **same HTTP endpoints** Ollama does. When GitHub Copilot Chat (configured with an Ollama provider) sends a request, the proxy:
+
+1. **Receives** the Ollama-format request (model tag lookup, model info, or chat completion)
+2. **Authenticates** against Qwen's OAuth2 endpoint, handling token refresh automatically with a 30-second buffer before expiry
+3. **Translates** the request to Qwen's OpenAI-compatible API format and forwards it
+4. **Streams** or returns the response back in the format Copilot Chat expects
+
+The proxy preserves the **same port (11434)** and **same API surface** as a local Ollama instance, so no special VS Code configuration beyond selecting Ollama as the provider is needed.
+
+### Token Lifecycle
+
+```
+┌─────────────┐     ┌──────────────────┐     ┌──────────────┐
+│ Copilot Chat│────▶│ Qwen Proxy Server│────▶│ Qwen API     │
+│ (VS Code)   │     │                  │     │ (dashscope)  │
+└─────────────┘     │  ┌────────────┐  │     └──────────────┘
+                    │  │ OAuth      │  │           │
+                    │  │ Credentials│  │◀──────────┘
+                    │  │ (~/.qwen/) │  │   (tokens issued)
+                    │  └────────────┘  │
+                    │       │          │
+                    │       ▼          │
+                    │  ┌────────────┐  │
+                    │  │ Auto-      │  │
+                    │  │ Refresh    │  │
+                    │  │ (30s       │  │
+                    │  │  buffer)   │  │
+                    │  └────────────┘  │
+                    └──────────────────┘
+```
+
 ## Supported Models
 
 | Model | ID | Capabilities | Best For |
@@ -71,9 +104,10 @@ The server starts on **`http://localhost:11434`** (the same port Ollama uses —
 ## Features
 
 ### 🔧 Robust OAuth Authentication
-- Automatic token refresh with 30-second buffer
+- Automatic token refresh with 30-second buffer before expiry
 - Comprehensive error handling for credential issues
 - Secure credential storage and validation
+- Dynamic `resource_url` from credential file supports custom Qwen API endpoints
 
 ### 🔄 Retry Logic & Error Recovery
 - Automatic retries for network failures (up to 3 attempts)
@@ -81,28 +115,134 @@ The server starts on **`http://localhost:11434`** (the same port Ollama uses —
 - Graceful degradation and detailed error reporting
 
 ### 📊 Enhanced Monitoring
-- Health check endpoint at `/health`
-- Detailed status reporting
-- Real-time authentication status
+- Health check endpoint at `/health` with authentication status
+- Detailed startup logging (credentials, models, server address)
+- Real-time authentication status reporting
 
 ### 🎯 Model Selection
 - Both `qwen3-coder-plus` and `vision-model` available
 - Proper capability reporting (tools, vision)
-- Model-specific context window handling (32K tokens)
+- Model-specific context window handling (32K tokens for both models)
+
+### 🔁 Streaming & Non-Streaming Support
+- Full SSE streaming for real-time chat completions
+- Non-streaming fallback for compatible clients
+- Both modes support automatic retry on auth failure
 
 ## API Endpoints
 
 ### Ollama-Compatible Endpoints
-- `GET /api/tags` — Returns list of available Qwen models in Ollama format
-- `GET /api/list` — Alias for `/api/tags`
-- `POST /api/show` — Retrieves detailed model information including capabilities
-- `POST /v1/chat/completions` — OpenAI-compatible chat completions (streaming + non-streaming)
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/api/tags` | Returns list of available Qwen models in Ollama format |
+| `GET` | `/api/list` | Alias for `/api/tags` |
+| `POST` | `/api/show` | Retrieves detailed model information including capabilities |
+| `POST` | `/v1/chat/completions` | OpenAI-compatible chat completions (streaming + non-streaming) |
 
 ### Monitoring Endpoints
-- `GET /` — Server status and available models
-- `GET /health` — Health check with authentication status
-- `GET /api/version` — Returns Ollama version 0.6.4 for compatibility
-- `GET /version` — Returns proxy version and supported models
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/` | Server status and available models |
+| `GET` | `/health` | Health check with authentication status |
+| `GET` | `/api/version` | Returns Ollama version 0.6.4 for compatibility |
+| `GET` | `/version` | Returns proxy version and supported models |
+| `GET` | `/api/ps` | Returns running models (empty list — proxy doesn't run models locally) |
+
+### Example: Quick Health Check
+
+```bash
+curl http://localhost:11434/health
+```
+
+Expected response:
+```json
+{
+  "status": "healthy",
+  "authenticated": true,
+  "models_supported": ["qwen3-coder-plus", "vision-model"]
+}
+```
+
+### Example: List Available Models
+
+```bash
+curl http://localhost:11434/api/tags
+```
+
+### Example: Chat Completion (Non-Streaming)
+
+```bash
+curl -X POST http://localhost:11434/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "qwen3-coder-plus",
+    "messages": [{"role": "user", "content": "Write a Python fibonacci function"}],
+    "stream": false
+  }'
+```
+
+## Configuration
+
+### Credential File Structure
+
+The proxy reads Qwen OAuth credentials from `~/.qwen/oauth_creds.json`. The file must contain:
+
+```json
+{
+  "access_token": "your-access-token",
+  "refresh_token": "your-refresh-token",
+  "token_type": "Bearer",
+  "expiry_date": 1700000000000,
+  "resource_url": "https://dashscope.aliyuncs.com/compatible-mode/v1"
+}
+```
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `access_token` | ✅ | Active Qwen API access token |
+| `refresh_token` | ✅ | Token used to obtain new access tokens |
+| `token_type` | ✅ | Typically `"Bearer"` |
+| `expiry_date` | ✅ | Token expiry as Unix milliseconds |
+| `resource_url` | ❌ | Qwen API base URL (defaults to `https://dashscope.aliyuncs.com/compatible-mode/v1`) |
+
+### Custom Port
+
+To run the proxy on a different port (e.g., if Ollama is already using 11434):
+
+```bash
+uvicorn proxy_server:app --host localhost --port 11435 --reload
+```
+
+Then configure Copilot Chat's Ollama provider to point to `http://localhost:11435`.
+
+## Quick Reference
+
+### Cheatsheet
+
+```bash
+# Start the proxy
+python proxy_server.py
+
+# Start on custom port
+uvicorn proxy_server:app --host localhost --port 11435
+
+# Health check
+curl http://localhost:11434/health
+
+# List models
+curl http://localhost:11434/api/tags
+
+# Send a chat request
+curl -X POST http://localhost:11434/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model": "qwen3-coder-plus", "messages": [{"role": "user", "content": "Hello"}], "stream": false}'
+
+# Get server status
+curl http://localhost:11434/
+
+# Debug mode (verbose logs)
+uvicorn proxy_server:app --host localhost --port 11434 --log-level debug
+```
 
 ## Running with Docker
 
@@ -160,16 +300,6 @@ sudo systemctl enable --now qwen-copilot-proxy
 sudo systemctl status qwen-copilot-proxy
 ```
 
-## Custom Port
-
-To run the proxy on a different port (e.g., if Ollama is already using 11434):
-
-```bash
-uvicorn proxy_server:app --host localhost --port 11435 --reload
-```
-
-Then configure Copilot Chat's Ollama provider to point to `http://localhost:11435`.
-
 ## Troubleshooting
 
 ### Common Issues
@@ -181,21 +311,8 @@ Then configure Copilot Chat's Ollama provider to point to `http://localhost:1143
 | Shows actual Ollama models instead of Qwen | Another service on port 11434 | Stop Ollama: `sudo systemctl stop ollama` or use a custom port |
 | Network errors / timeouts | Internet connectivity | The proxy auto-retries up to 3 times; check your connection |
 | "Port 11434 already in use" | Conflicting service | `lsof -i :11434` to find the culprit, then stop it or change port |
-
-### Health Check
-
-```bash
-curl http://localhost:11434/health
-```
-
-Expected response:
-```json
-{
-  "status": "healthy",
-  "authenticated": true,
-  "models_supported": ["qwen3-coder-plus", "vision-model"]
-}
-```
+| Auth fails after container restart | Credentials not mounted | Verify `~/.qwen/oauth_creds.json` exists on the host *before* starting the container |
+| `/health` returns `"unhealthy"` | Credentials not loaded | Restart the proxy — it attempts auth on startup; check startup logs for details |
 
 ### Debug Mode
 
@@ -211,6 +328,7 @@ uvicorn proxy_server:app --host localhost --port 11434 --log-level debug
 2. **Token Management**: Tokens auto-refresh; restart the proxy occasionally for a fresh authentication cycle
 3. **Model Selection**: Use `qwen3-coder-plus` for pure coding and `vision-model` only when you need vision capabilities — the coder model is faster and more responsive for code tasks
 4. **Session Persistence**: Run as a systemd service (see above) so the proxy stays available across logins
+5. **Docker Resource Limits**: When using Docker, consider setting `--memory="512m"` and `--cpus="1.0"` to avoid resource contention
 
 ## Version
 
@@ -219,6 +337,22 @@ uvicorn proxy_server:app --host localhost --port 11434 --log-level debug
 - Check version: `curl http://localhost:11434/version`
 - View changelog: [CHANGELOG.md](CHANGELOG.md)
 - Report issues: [GitHub Issues](https://github.com/chaitanyame/Qwen-Copilot-Proxy/issues)
+
+## Related Projects
+
+- [Cline](https://github.com/cline/cline) — Qwen implementation that inspired the OAuth handling and retry logic
+- [Qwen-code CLI](https://github.com/QwenLM/qwen-code) — Official Qwen CLI tool for authentication and model interaction
+- [Ollama](https://github.com/ollama/ollama) — Local LLM runner whose API format this proxy emulates
+
+## Contributing
+
+Contributions are welcome! Please feel free to submit a Pull Request.
+
+1. Fork the repository
+2. Create your feature branch (`git checkout -b feat/amazing-feature`)
+3. Commit your changes (`git commit -m 'feat: add amazing feature'`)
+4. Push to the branch (`git push origin feat/amazing-feature`)
+5. Open a Pull Request
 
 ## License
 
